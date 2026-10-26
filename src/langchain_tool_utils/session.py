@@ -1,139 +1,103 @@
-"""Reset conversation history at the invocation boundary when its API changes."""
+"""Session policy only: select history and consume the current request."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import NotRequired
 
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import RemoveMessage, convert_to_messages
 from langgraph.config import get_config
-from langgraph.graph.message import REMOVE_ALL_MESSAGES
+from langgraph.types import Overwrite
 
 from .history import UnsafeHistoryError
 
 
 class ApiSessionState(AgentState):
     session_api: NotRequired[str]
+    session_run_active: NotRequired[bool]
+    request_messages: NotRequired[list]
 
 
 class ApiSessionMiddleware(AgentMiddleware):
-    state_schema = ApiSessionState
+    """API switches discard history; cleanup is a separate middleware's job.
 
-    def __init__(self, default_api):
-        self.default_api = default_api
-
-    def before_model(self, state, runtime):
-        requested = get_config().get("configurable", {}).get("api", self.default_api)
-        if state.get("session_api") != requested:
-            raise UnsafeHistoryError("API changes must enter through ApiSessionAgent")
-
-    async def abefore_model(self, state, runtime):
-        return self.before_model(state, runtime)
-
-
-def prepare_session_input(value, *, previous_api, api, has_history, interrupted):
-    """Build a fresh input; never guess which merged messages belong to this turn."""
-    if api not in {"responses", "chat_completions"}:
-        raise ValueError(f"Unsupported API: {api!r}")
-    changed = previous_api != api and (previous_api is not None or has_history)
-    if changed and (interrupted or value is None):
-        raise UnsafeHistoryError(
-            "Finish the interrupted run using its original API before switching"
-        )
-    if value is None:
-        return None
-    if not isinstance(value, Mapping):
-        # Command resumes need the same API and retain their original input shape.
-        if changed:
-            raise UnsafeHistoryError("API switching requires a new message input")
-        return value
-    output = dict(value)
-    if "session_api" in output:
-        raise ValueError("session_api is managed by ApiSessionAgent")
-    if "messages" in output:
-        output["messages"] = [
-            m.model_copy(deep=True) for m in convert_to_messages(output["messages"])
-        ]
-    if changed:
-        messages = output.get("messages", [])
-        if not messages:
-            raise ValueError("API switching requires at least one new message")
-        if any(isinstance(m, RemoveMessage) for m in messages):
-            raise ValueError(
-                "API switching accepts new messages, not removal directives"
-            )
-        output["messages"] = [RemoveMessage(id=REMOVE_ALL_MESSAGES), *messages]
-    output["session_api"] = api
-    return output
-
-
-class ApiSessionAgent:
-    """Graph facade: same API keeps history; API changes start a fresh conversation.
-
-    Callers must serialize invocations and state updates for each thread. Execution
-    journal entries and non-message state are retained. Without a checkpointer,
-    every invocation is already a new conversation.
+    Supply new turns in request_messages. Internal session fields are managed by
+    this middleware. Serialize runs and external state updates per thread.
     """
 
-    def __init__(self, graph, *, default_api, has_checkpointer):
-        self.graph = graph
+    state_schema = ApiSessionState
+
+    def __init__(self, default_api="responses"):
+        if default_api not in {"responses", "chat_completions"}:
+            raise ValueError("Unsupported API")
         self.default_api = default_api
-        self.has_checkpointer = has_checkpointer
 
-    def __getattr__(self, name):
-        if name in {
-            "get_state",
-            "aget_state",
-            "get_state_history",
-            "aget_state_history",
-            "update_state",
-            "aupdate_state",
-            "get_graph",
-            "aget_graph",
-        }:
-            return getattr(self.graph, name)
-        raise AttributeError(
-            f"ApiSessionAgent does not expose {name!r}; use invoke/stream or async equivalents"
-        )
+    def _api(self):
+        api = get_config().get("configurable", {}).get("api", self.default_api)
+        if api not in {"responses", "chat_completions"}:
+            raise ValueError(f"Unsupported API: {api!r}")
+        return api
 
-    def _prepare(self, value, config, snapshot):
-        api = (config or {}).get("configurable", {}).get("api", self.default_api)
-        state = snapshot.values if snapshot else {}
-        return prepare_session_input(
-            value,
-            previous_api=state.get("session_api"),
-            api=api,
-            has_history=bool(state.get("messages")),
-            interrupted=bool(snapshot and snapshot.next),
-        )
+    def before_agent(self, state, runtime):
+        api = self._api()
+        previous = state.get("session_api")
+        history = state.get("messages", [])
+        changed = previous != api and (previous is not None or bool(history))
+        if changed and state.get("session_run_active"):
+            raise UnsafeHistoryError(
+                "Finish the interrupted run using its original API before switching"
+            )
+        incoming = convert_to_messages(state.get("request_messages", []))
+        if any(isinstance(message, RemoveMessage) for message in incoming):
+            raise ValueError(
+                "request_messages accepts messages, not removal directives"
+            )
+        if changed and not incoming:
+            raise ValueError("API switching requires new request_messages")
+        selected = incoming if changed else [*history, *incoming]
+        return {
+            "messages": Overwrite(
+                [message.model_copy(deep=True) for message in selected]
+            ),
+            "request_messages": [],
+            "session_api": api,
+            "session_run_active": True,
+        }
 
-    def invoke(self, input, config=None, **kwargs):
-        snapshot = self.graph.get_state(config) if self.has_checkpointer else None
-        return self.graph.invoke(
-            self._prepare(input, config, snapshot), config, **kwargs
-        )
+    async def abefore_agent(self, state, runtime):
+        return self.before_agent(state, runtime)
 
-    async def ainvoke(self, input, config=None, **kwargs):
-        snapshot = (
-            await self.graph.aget_state(config) if self.has_checkpointer else None
-        )
-        return await self.graph.ainvoke(
-            self._prepare(input, config, snapshot), config, **kwargs
-        )
+    def _guard_resume(self, state):
+        if state.get("session_api") != self._api():
+            raise UnsafeHistoryError(
+                "Resume the interrupted run using its original API"
+            )
 
-    def stream(self, input, config=None, **kwargs):
-        snapshot = self.graph.get_state(config) if self.has_checkpointer else None
-        yield from self.graph.stream(
-            self._prepare(input, config, snapshot), config, **kwargs
-        )
+    def before_model(self, state, runtime):
+        self._guard_resume(state)
 
-    async def astream(self, input, config=None, **kwargs):
-        snapshot = (
-            await self.graph.aget_state(config) if self.has_checkpointer else None
-        )
-        async for event in self.graph.astream(
-            self._prepare(input, config, snapshot), config, **kwargs
-        ):
-            yield event
+    async def abefore_model(self, state, runtime):
+        self.before_model(state, runtime)
+
+    def wrap_model_call(self, request, handler):
+        self._guard_resume(request.state)
+        return handler(request)
+
+    async def awrap_model_call(self, request, handler):
+        self._guard_resume(request.state)
+        return await handler(request)
+
+    def wrap_tool_call(self, request, handler):
+        self._guard_resume(request.state)
+        return handler(request)
+
+    async def awrap_tool_call(self, request, handler):
+        self._guard_resume(request.state)
+        return await handler(request)
+
+    def after_agent(self, state, runtime):
+        return {"session_run_active": False}
+
+    async def aafter_agent(self, state, runtime):
+        return self.after_agent(state, runtime)

@@ -134,13 +134,15 @@ def test_switch_api_same_checkpoint_and_actual_wire_format(tmp_path, first, seco
     try:
         config = {"configurable": {"thread_id": "switch", "api": first}}
         result = agent.invoke(
-            {"messages": [HumanMessage("go")]}, config, durability="sync"
+            {"request_messages": [HumanMessage("go")]}, config, durability="sync"
         )
         assert [
             m.content for m in result["messages"] if isinstance(m, ToolMessage)
         ] == ["6"]
         config["configurable"]["api"] = second
-        agent.invoke({"messages": [HumanMessage("again")]}, config, durability="sync")
+        agent.invoke(
+            {"request_messages": [HumanMessage("again")]}, config, durability="sync"
+        )
         assert executed == [3]
         assert requests[-1][0].endswith(
             "/responses" if second == "responses" else "/chat/completions"
@@ -206,7 +208,7 @@ async def test_chat_sse_eof_without_terminal_never_executes_complete_json(tmp_pa
     try:
         with pytest.raises(UnsafeHistoryError, match="terminal"):
             await agent.ainvoke(
-                {"messages": [HumanMessage("go")]},
+                {"request_messages": [HumanMessage("go")]},
                 {"configurable": {"thread_id": "partial", "api": "chat_completions"}},
             )
         assert executed == []
@@ -258,7 +260,7 @@ async def test_responses_sse_eof_without_completed_never_executes(tmp_path):
     try:
         with pytest.raises(UnsafeHistoryError):
             await agent.ainvoke(
-                {"messages": [HumanMessage("go")]},
+                {"request_messages": [HumanMessage("go")]},
                 {"configurable": {"thread_id": "partial", "api": "responses"}},
             )
         assert executed == []
@@ -289,7 +291,7 @@ async def test_sse_stall_closes_transport_and_does_not_commit_model(tmp_path):
     config = {"configurable": {"thread_id": "stall", "api": "chat_completions"}}
     try:
         events = agent.astream(
-            {"messages": [HumanMessage("go")]},
+            {"request_messages": [HumanMessage("go")]},
             config,
             stream_mode="messages",
             durability="sync",
@@ -344,7 +346,7 @@ def test_truncated_nonstream_response_never_executes(tmp_path, api):
     try:
         with pytest.raises(UnsafeHistoryError, match="terminal"):
             agent.invoke(
-                {"messages": [HumanMessage("go")]},
+                {"request_messages": [HumanMessage("go")]},
                 {"configurable": {"thread_id": "partial", "api": api}},
             )
         assert executed == []
@@ -449,7 +451,7 @@ async def test_successful_sse_tool_then_final_text(tmp_path, api):
     )
     try:
         result = await agent.ainvoke(
-            {"messages": [HumanMessage("go")]},
+            {"request_messages": [HumanMessage("go")]},
             {"configurable": {"thread_id": "complete", "api": api}},
         )
         assert executed == [3]

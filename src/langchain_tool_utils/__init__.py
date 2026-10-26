@@ -7,11 +7,11 @@ from .history import (
 from .journal import SQLiteJournal
 from .middleware import ToolHealingMiddleware
 from .protocols import portable_history, validate_messages
-from .session import ApiSessionAgent
+from .session import ApiSessionMiddleware
 from .streaming import StreamIdleTimeout, watch_stream
 
 __all__ = [
-    "ApiSessionAgent",
+    "ApiSessionMiddleware",
     "SQLiteJournal",
     "StreamIdleTimeout",
     "ToolHealingMiddleware",

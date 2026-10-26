@@ -4,12 +4,11 @@ from uuid import uuid4
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ExtendedModelResponse
-from langchain_core.messages import AIMessage, RemoveMessage, ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.config import get_config
 from langgraph.errors import GraphBubbleUp
-from langgraph.graph.message import REMOVE_ALL_MESSAGES
-from langgraph.types import Command
+from langgraph.types import Command, Overwrite
 
 from .history import (
     UnsafeHistoryError,
@@ -63,7 +62,7 @@ class ToolHealingMiddleware(AgentMiddleware):
     def before_agent(self, state, runtime):
         healed = self._heal(state["messages"])
         if healed != state["messages"]:
-            return {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *healed]}
+            return {"messages": Overwrite(healed)}
         return None
 
     async def abefore_agent(self, state, runtime):

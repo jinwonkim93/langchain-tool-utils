@@ -61,8 +61,7 @@ LangGraph의 `add_messages` reducer에서는 목록을 반환하면 append/merge
 
 ```python
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import RemoveMessage
-from langgraph.graph.message import REMOVE_ALL_MESSAGES
+from langgraph.types import Overwrite
 from langchain_tool_utils import clean_messages
 
 class CleanMessagesMiddleware(AgentMiddleware):
@@ -70,7 +69,7 @@ class CleanMessagesMiddleware(AgentMiddleware):
         cleaned = clean_messages(state["messages"])
         if cleaned == state["messages"]:
             return None
-        return {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *cleaned]}
+        return {"messages": Overwrite(value=cleaned)}
 
     async def abefore_model(self, state, runtime):
         return self.before_model(state, runtime)
@@ -99,18 +98,26 @@ with SqliteSaver.from_conn_string("agent.sqlite") as saver:
         checkpointer=saver,
     )
     config = {"configurable": {"thread_id": "order-123", "api": "responses"}}
-    agent.invoke({"messages": [("user", "주문 123 확인")]}, config, durability="sync")
+    agent.invoke({"request_messages": [("user", "주문 123 확인")]}, config, durability="sync")
     config["configurable"]["api"] = "chat_completions"
-    agent.invoke({"messages": [("user", "다음 단계는?")]}, config, durability="sync")
+    agent.invoke({"request_messages": [("user", "다음 단계는?")]}, config, durability="sync")
 ```
 
 `OPENAI_API_KEY`가 필요합니다. `clean_messages` 자체는 journal이나 agent에 의존하지 않습니다. 위 factory는 실행 journal을 추가한 선택적 구성입니다. 동일 call ID의 도구 재실행을 막고, graph 저장 전 프로세스가 종료되면 저장된 결과를 재사용합니다. 종료 후 실행 결과를 모르면 PENDING, 실행 예외는 ERROR로 전달합니다. 서로 다른 call ID로 같은 작업을 요청하는 경우까지 exactly-once를 보장하지 않습니다.
 
 같은 `thread_id`에서 API가 바뀌면 저장된 messages를 초기화하고 **이번 호출의 새 메시지만** 남깁니다. 같은 API에서는 이력을 유지합니다. API를 다시 바꿔도 이전 이력을 복원하지 않습니다. reasoning을 포함한 이전 API 전용 데이터는 새 API에 전달하지 않습니다.
 
-factory는 graph를 감싼 `ApiSessionAgent`를 반환합니다. `invoke`, `ainvoke`, `stream`, `astream` 진입점에서 저장된 `session_api`를 확인하고, 변경 시 `REMOVE_ALL_MESSAGES`와 새 입력을 하나의 graph 입력으로 전달합니다. `get_state`/`update_state`와 비동기 대응 메서드도 지원합니다. `batch`, `astream_events`, `with_config` 등 다른 Runnable 진입점은 지원하지 않습니다. 같은 thread의 호출은 서버에서 직렬화하세요.
+factory는 `create_agent`의 **CompiledStateGraph를 그대로 반환**합니다. 새 요청은 `messages` 대신 `request_messages`로 전달하세요. 기존 `ApiSessionAgent` 래퍼는 제거했습니다.
 
-중단된 graph 실행 중에는 API 전환을 거부합니다. 원래 API로 재개·완료한 뒤 새 요청으로 전환해야 합니다. API 정보가 없는 기존 checkpoint의 메시지는 첫 새 요청에서 초기화합니다. 메시지를 초기화해도 실행 journal과 messages 이외의 state는 유지합니다. 이전 checkpoint snapshot은 삭제하지 않으므로 데이터 삭제 기능은 아닙니다. 시스템 지침은 `create_agent`의 `system_prompt`로 설정하면 전환 후에도 적용됩니다.
+역할은 다음처럼 분리합니다.
+
+- `ApiSessionMiddleware.before_agent`: 저장된 `session_api`와 요청 API를 비교합니다. 같으면 기존 이력 + 요청 메시지, 다르면 요청 메시지만 선택합니다. `Overwrite`로 저장하고 `request_messages`를 비웁니다. 메시지를 정리하거나 결과를 생성하지 않습니다.
+- `ToolHealingMiddleware.before_agent` / `before_model`: 선택된 메시지를 `clean_messages`로 정리하고, 달라졌을 때만 `Overwrite`로 저장합니다.
+- `clean_messages`: API 변경이나 세션 초기화를 판단하지 않습니다. 전달받은 메시지 관계만 정리합니다.
+
+중단된 실행은 원래 API로 재개·완료한 뒤 전환해야 합니다. 재개가 `before_agent`를 건너뛰더라도 모델·도구 실행 직전 검사로 API 변경을 차단합니다. API 정보가 없는 기존 checkpoint는 새 `request_messages`가 들어오면 해당 목록으로 초기화합니다. `session_api`, `session_run_active`는 middleware 내부 필드이므로 호출자가 설정하지 마세요.
+
+일반 graph이므로 middleware 검증 전에 입력 자체가 checkpoint에 저장될 수 있습니다. 거부된 요청을 재시도할 때는 올바른 API와 `request_messages`를 명시하세요. 같은 thread의 실행·외부 state 수정은 서버에서 직렬화해야 합니다. 실행 journal, 비메시지 state, 이전 checkpoint snapshot은 초기화하지 않습니다. 시스템 지침은 `system_prompt`로 설정하면 전환 후에도 적용됩니다.
 
 `portable_history`는 명시적으로 요청할 때만 쓰는 기존 호환 함수이며 자동 전환 경로에서는 사용하지 않습니다. provider 내장 tool과 legacy function_call은 지원하지 않습니다. `heal_history`는 메시지 목록만 반환합니다.
 

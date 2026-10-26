@@ -8,7 +8,7 @@ from langchain_openai import ChatOpenAI
 
 from .journal import SQLiteJournal
 from .middleware import ToolHealingMiddleware
-from .session import ApiSessionAgent, ApiSessionMiddleware
+from .session import ApiSessionMiddleware
 
 
 def create_healing_agent(
@@ -25,8 +25,8 @@ def create_healing_agent(
 ):
     """Switch API per invocation with configurable.api; reuse one thread's state.
 
-    Same-API calls retain history. Switching API resets messages at the input
-    boundary and retains only the new input messages.
+    Same-API calls retain history. Switching API resets messages in before_agent
+    and retains only the new request_messages.
     """
     if api not in {"responses", "chat_completions"}:
         raise ValueError("api must be responses or chat_completions")
@@ -75,14 +75,10 @@ def create_healing_agent(
         for name in ("responses", "chat_completions")
     }
     healing = ToolHealingMiddleware(journal, models=models, default_api=api)
-    graph = create_agent(
+    return create_agent(
         models[api],
         tools,
         middleware=[ApiSessionMiddleware(api), *middleware, healing],
         checkpointer=checkpointer,
         **agent_options,
-    )
-
-    return ApiSessionAgent(
-        graph, default_api=api, has_checkpointer=checkpointer is not None
     )

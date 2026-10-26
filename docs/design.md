@@ -34,7 +34,7 @@ scope는 thread ID와 상위 subgraph namespace입니다. LangGraph의 현재 mo
 
 독립 함수 `clean_messages`는 DB 없이 정리된 목록만 반환합니다. 중복 메시지/호출은 마지막 항목을 유지하고, 실제 결과는 합성 PENDING보다 우선합니다. 고아 결과는 삭제하고, 뒤늦은 결과도 전체 이력의 call ID로 연결합니다. 검사 전용 함수 `validate_messages`는 성공하면 None, 실패하면 예외를 반환합니다. 별도 repair 보고서는 없습니다.
 
-정리된 목록은 checkpoint에 저장합니다. 세션 API가 바뀌면 입력 병합 전에 과거 messages를 초기화합니다. 같은 API에서는 reasoning을 포함한 이력을 보존합니다. 같은 thread의 동시 쓰기를 직렬화하는 것은 호스트 책임입니다.
+정리된 목록은 checkpoint에 저장합니다. 세션 API가 바뀌면 before_agent에서 별도 request_messages를 사용해 과거 messages를 초기화합니다. 같은 API에서는 reasoning을 포함한 이력을 보존합니다. 같은 thread의 동시 쓰기를 직렬화하는 것은 호스트 책임입니다.
 
 미들웨어는 마지막에 배치해 retry/승인 미들웨어에서 handler를 반복 호출할 때도 원자적 claim을 통과하게 합니다. tool 함수 자체의 내부 재시도는 통제하지 않습니다. 모델의 다음 턴이 새로운 ID로 같은 도구를 요청하는 경우에는 비즈니스 idempotency 계층이 필요합니다.
 
@@ -90,15 +90,19 @@ is not a lock for concurrent graph invocations or whole-history writes.
   the default `clean_messages(messages)` path.
 - `protocols.py`: optional OpenAI serialization validation; explicit legacy
   projection stays available but is not used to migrate session history.
-- `session.py`: prepares fresh graph input based on persisted `session_api`.
-  Switched input replaces messages using the reducer's remove-all sentinel.
-  Read/prepare/write requires caller-side serialization per thread.
-- `middleware.py`: persists cleaned state, validates model requests and fences
-  execution. Tool journal data survives message resets.
+- `session.py`: ApiSessionMiddleware selects history in before_agent using
+  persisted session_api and separate request_messages, writes Overwrite, and
+  clears the consumed request. It never calls cleanup.
+- `middleware.py`: independently cleans selected history and persists changes
+  using Overwrite. Tool journal data survives message resets.
 
-The facade is deliberately limited to invoke/ainvoke/stream/astream. It is not a
-CompiledStateGraph or a complete Runnable substitute. Pending graph work cannot
-switch API; old checkpoint snapshots and non-message state are retained. External
-writers must not modify the managed session_api field or inject messages from a
-different API. These boundaries avoid guessing a current-turn suffix from merged
-history and avoid silently cancelling possibly running side effects.
+The factory returns the original CompiledStateGraph, without an invocation
+facade. Request messages must be supplied in request_messages; the messages
+channel is accumulated history. Session middleware precedes cleanup middleware.
+Resume guards run at model and tool execution because before_agent/before_model
+may be skipped when resuming a checkpoint. session_run_active remains true after
+interruptions and errors, preventing API changes until completion. This is not a
+concurrency lock: serialize runs and external updates per thread. Managed session
+fields must not be injected by callers. Standard graph input is checkpointed
+before middleware validation, so rejected requests can remain in request_messages;
+retry with explicit corrected input. Old snapshots and non-message state remain.
