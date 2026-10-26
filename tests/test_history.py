@@ -224,14 +224,6 @@ def test_unknown_provider_builtin_rejected_instead_of_silently_discarded():
         clean_messages([AIMessage(content=[{"type": "web_search_call", "id": "ws_1"}])])
 
 
-def test_durable_pending_replaced_using_recovery_callback():
-    cleaned = clean_messages([ai("a")])
-    recovered = clean_messages(
-        cleaned, recover=lambda owner, call: result(call["id"], "saved")
-    )
-    assert recovered[1].content == "saved"
-
-
 def test_reducer_replacement_really_removes_orphans_and_duplicates():
     original = [
         HumanMessage("go", id="h"),

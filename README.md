@@ -83,7 +83,7 @@ class CleanMessagesMiddleware(AgentMiddleware):
 import os
 from langchain_core.tools import tool
 from langgraph.checkpoint.sqlite import SqliteSaver
-from langchain_tool_utils import SQLiteJournal, create_healing_agent
+from langchain_tool_utils import create_healing_agent
 
 @tool
 def lookup(order_id: str) -> str:
@@ -94,7 +94,6 @@ with SqliteSaver.from_conn_string("agent.sqlite") as saver:
     agent = create_healing_agent(
         model=os.environ["OPENAI_MODEL"],  # 두 API를 지원하는 모델
         tools=[lookup],
-        journal=SQLiteJournal("executions.sqlite"),
         checkpointer=saver,
     )
     config = {"configurable": {"thread_id": "order-123", "api": "responses"}}
@@ -103,7 +102,7 @@ with SqliteSaver.from_conn_string("agent.sqlite") as saver:
     agent.invoke({"request_messages": [("user", "다음 단계는?")]}, config, durability="sync")
 ```
 
-`OPENAI_API_KEY`가 필요합니다. `clean_messages` 자체는 journal이나 agent에 의존하지 않습니다. 위 factory는 실행 journal을 추가한 선택적 구성입니다. 동일 call ID의 도구 재실행을 막고, graph 저장 전 프로세스가 종료되면 저장된 결과를 재사용합니다. 종료 후 실행 결과를 모르면 PENDING, 실행 예외는 ERROR로 전달합니다. 서로 다른 call ID로 같은 작업을 요청하는 경우까지 exactly-once를 보장하지 않습니다.
+`OPENAI_API_KEY`가 필요합니다. `clean_messages`는 agent나 DB 없이 사용할 수 있습니다. middleware는 누락된 결과를 PENDING으로 정리하고 도구 실행 예외를 ERROR로 전달합니다. 도구의 실제 실행 여부를 추적하거나 중복 실행을 막지는 않습니다.
 
 같은 `thread_id`에서 API가 바뀌면 저장된 messages를 초기화하고 **이번 호출의 새 메시지만** 남깁니다. 같은 API에서는 이력을 유지합니다. API를 다시 바꿔도 이전 이력을 복원하지 않습니다. reasoning을 포함한 이전 API 전용 데이터는 새 API에 전달하지 않습니다.
 
@@ -117,7 +116,7 @@ factory는 `create_agent`의 **CompiledStateGraph를 그대로 반환**합니다
 
 중단된 실행은 원래 API로 재개·완료한 뒤 전환해야 합니다. 재개가 `before_agent`를 건너뛰더라도 모델·도구 실행 직전 검사로 API 변경을 차단합니다. API 정보가 없는 기존 checkpoint는 새 `request_messages`가 들어오면 해당 목록으로 초기화합니다. `session_api`, `session_run_active`는 middleware 내부 필드이므로 호출자가 설정하지 마세요.
 
-일반 graph이므로 middleware 검증 전에 입력 자체가 checkpoint에 저장될 수 있습니다. 거부된 요청을 재시도할 때는 올바른 API와 `request_messages`를 명시하세요. 같은 thread의 실행·외부 state 수정은 서버에서 직렬화해야 합니다. 실행 journal, 비메시지 state, 이전 checkpoint snapshot은 초기화하지 않습니다. 시스템 지침은 `system_prompt`로 설정하면 전환 후에도 적용됩니다.
+일반 graph이므로 middleware 검증 전에 입력 자체가 checkpoint에 저장될 수 있습니다. 거부된 요청을 재시도할 때는 올바른 API와 `request_messages`를 명시하세요. 같은 thread의 실행·외부 state 수정은 서버에서 직렬화해야 합니다. 비메시지 state와 이전 checkpoint snapshot은 초기화하지 않습니다. 시스템 지침은 `system_prompt`로 설정하면 전환 후에도 적용됩니다.
 
 `portable_history`는 명시적으로 요청할 때만 쓰는 기존 호환 함수이며 자동 전환 경로에서는 사용하지 않습니다. provider 내장 tool과 legacy function_call은 지원하지 않습니다. `heal_history`는 메시지 목록만 반환합니다.
 
@@ -127,7 +126,7 @@ factory는 `create_agent`의 **CompiledStateGraph를 그대로 반환**합니다
 
 `watch_stream(agent.astream(...), idle_timeout=90, total_timeout=300)`은 이벤트가 멈춘 async stream을 취소합니다. 부분 chunk를 state에 AIMessage로 넣지 않습니다. `create_healing_agent`는 모델의 정상 종료 이벤트가 없는 tool call을 실행하지 않습니다. HTTP read timeout도 설정됩니다.
 
-graph 이벤트가 없는 긴 도구 실행은 watchdog에 걸릴 수 있고, 동기 작업이나 취소를 무시하는 소스를 강제 종료할 수는 없습니다. 실행 journal과 durable checkpointer를 함께 사용하는 경우 재시작 후 동일 thread ID로 `agent.invoke(None, config, durability="sync")`를 호출할 수 있습니다. tool 내부 interrupt는 재실행을 필요로 하므로 journal은 차단합니다. 승인은 tools 노드 이전에 배치하세요.
+graph 이벤트가 없는 긴 도구 실행은 watchdog에 걸릴 수 있고, 동기 작업이나 취소를 무시하는 소스를 강제 종료할 수는 없습니다. `agent.invoke(None, config)`나 `Command(resume=...)` 재개는 LangGraph의 기본 동작을 따르며 도구가 다시 실행될 수 있습니다. 실제 효과 확인과 재시도 정책은 애플리케이션 책임입니다. 새 요청으로 실행하면 `before_agent`에서 기존 이력의 누락 결과를 PENDING으로 정리합니다.
 
 ## 설치와 테스트
 
@@ -138,10 +137,10 @@ python3 -m venv .venv
 .venv/bin/ruff check src tests examples
 ```
 
-고정된 테스트 의존성은 `requirements-test.lock`에 있습니다. 테스트는 API key 없이 실제 LangChain 직렬화와 모의 HTTP/SSE를 검증합니다. 실제 하위 프로세스를 종료한 뒤 SQLite checkpoint/journal에서 복구하는 테스트도 포함합니다.
+고정된 테스트 의존성은 `requirements-test.lock`에 있습니다. 테스트는 API key 없이 실제 LangChain 직렬화와 모의 HTTP/SSE를 검증합니다. 실제 하위 프로세스를 종료한 뒤 디스크 checkpoint를 읽어 새 요청에서 누락된 결과를 정리하는 테스트도 포함합니다.
 
 추가 조합 테스트는 짧은 이력 4,681개, 7개 이벤트 순열 5,040개, 고정 seed의 긴 이력 100개를 독립적인 기대값 계산과 비교합니다. JSON 저장·복원 전후 멱등성, 입력 불변성, 두 API 직렬화, 늦은 결과와 ID 길이 변경도 검사합니다. 유한 범위를 전수 검사하며 모든 가능한 입력이나 실제 API 무오류를 보장하는 것은 아닙니다.
 
-서빙 계층에서는 같은 thread의 실행과 checkpoint 교체를 직렬화해야 합니다. 실행 journal은 개별 도구 호출을 보호하며, 동시 graph 실행의 전체 state 저장을 잠그지는 않습니다.
+서빙 계층에서는 같은 thread의 실행과 checkpoint 교체를 직렬화해야 합니다. 이 모듈은 동시 graph 실행의 전체 state 저장을 잠그지 않습니다.
 
 [설계와 참고 자료](docs/design.md)

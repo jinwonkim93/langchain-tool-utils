@@ -10,7 +10,6 @@ from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
 
 from langchain_tool_utils import (
-    SQLiteJournal,
     StreamIdleTimeout,
     UnsafeHistoryError,
     create_healing_agent,
@@ -58,7 +57,6 @@ def setup_agent(tmp_path, handler, *, streaming=False, async_handler=None):
     agent = create_healing_agent(
         model="test-model",
         tools=[lookup],
-        journal=SQLiteJournal(tmp_path / "calls.sqlite"),
         checkpointer=InMemorySaver(),
         model_options={
             "api_key": "test-key",

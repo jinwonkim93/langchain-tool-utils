@@ -17,7 +17,7 @@ async def watch_stream(
     """Close/cancel a stalled async stream; never synthesize a finished message.
 
     Events are provisional until the model node commits. A timeout does not prove
-    a tool stopped. Resume using the same checkpoint, thread ID and journal.
+    a tool stopped. Check operation outcomes before resuming a checkpoint that can rerun tools.
     The deadline includes consumer backpressure. Sources must cooperate with
     cancellation; Python cannot forcibly stop an arbitrary blocked worker.
     """

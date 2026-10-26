@@ -6,7 +6,6 @@ import httpx
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 
-from .journal import SQLiteJournal
 from .middleware import ToolHealingMiddleware
 from .session import ApiSessionMiddleware
 
@@ -15,7 +14,6 @@ def create_healing_agent(
     *,
     model: str,
     tools,
-    journal: SQLiteJournal,
     api: str = "responses",
     read_timeout: float = 60,
     checkpointer=None,
@@ -74,7 +72,7 @@ def create_healing_agent(
         )
         for name in ("responses", "chat_completions")
     }
-    healing = ToolHealingMiddleware(journal, models=models, default_api=api)
+    healing = ToolHealingMiddleware(models=models, default_api=api)
     return create_agent(
         models[api],
         tools,

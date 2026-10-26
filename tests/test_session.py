@@ -186,7 +186,6 @@ def test_selection_then_cleanup_persisted_separately(tmp_path):
     from langchain_core.messages import ToolMessage
 
     from langchain_tool_utils import (
-        SQLiteJournal,
         ToolHealingMiddleware,
         validate_messages,
     )
@@ -196,7 +195,7 @@ def test_selection_then_cleanup_persisted_separately(tmp_path):
         [],
         middleware=[
             ApiSessionMiddleware(),
-            ToolHealingMiddleware(SQLiteJournal(tmp_path / "journal.sqlite")),
+            ToolHealingMiddleware(),
         ],
         checkpointer=InMemorySaver(),
     )

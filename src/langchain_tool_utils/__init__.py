@@ -4,7 +4,6 @@ from .history import (
     clean_messages,
     heal_history,
 )
-from .journal import SQLiteJournal
 from .middleware import ToolHealingMiddleware
 from .protocols import portable_history, validate_messages
 from .session import ApiSessionMiddleware
@@ -12,7 +11,6 @@ from .streaming import StreamIdleTimeout, watch_stream
 
 __all__ = [
     "ApiSessionMiddleware",
-    "SQLiteJournal",
     "StreamIdleTimeout",
     "ToolHealingMiddleware",
     "UnsafeHistoryError",

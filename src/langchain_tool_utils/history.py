@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 
 from langchain_core.messages import (
     AIMessage,
@@ -124,7 +124,6 @@ def clean_messages(
     *,
     max_call_id_length: int = 40,
     api: str | None = None,
-    recover: Callable[[AIMessage, dict], ToolMessage | None] | None = None,
 ) -> list[BaseMessage]:
     """Return a cleaned, persistable message list without mutating the input.
 
@@ -249,13 +248,12 @@ def clean_messages(
     for old, new in aliases.items():
         aliases_by_id.setdefault(new, {})[old] = new
     positions = {position: key for key, position in call_winners.items()}
-    owners = {}
+    owners = set()
     for i, msg in enumerate(source):
         if not isinstance(msg, AIMessage):
             continue
         calls = []
         for j, call in enumerate(msg.tool_calls):
-            original = call["id"]
             # Winner lookup uses the pre-remapping identity.
             old = positions.get((i, j))
             if old is None:
@@ -263,7 +261,7 @@ def clean_messages(
             call["id"] = mapping[old]
             call["type"] = "tool_call"
             calls.append(call)
-            owners[call["id"]] = (msg, call, original)
+            owners.add(call["id"])
         msg.tool_calls = calls
         _sync_call_blocks(msg, aliases)
         if calls:
@@ -307,18 +305,6 @@ def clean_messages(
         for call in msg.tool_calls:
             key = call["id"]
             result = results.get(key)
-            if recover and (result is None or _pending(result)):
-                original = owners[key][2]
-                # Recover using the execution identity, before ID normalization.
-                original = next(iter(aliases_by_id.get(key, {})), original)
-                saved = recover(msg, {**call, "id": original})
-                if saved is not None:
-                    result = saved.model_copy(deep=True)
-                    if aliases.get(result.tool_call_id, result.tool_call_id) != key:
-                        raise UnsafeHistoryError(
-                            "Recovered result has the wrong call ID"
-                        )
-                    result.tool_call_id = key
             if result is None:
                 result = pending_result(call)
                 while result.id in used_message_ids:
@@ -446,6 +432,6 @@ def _validate_structure(messages: Sequence, *, max_call_id_length: int = 40) -> 
         raise UnsafeHistoryError("Missing tool results")
 
 
-def heal_history(messages: Sequence, recover=None) -> list[BaseMessage]:
+def heal_history(messages: Sequence) -> list[BaseMessage]:
     """Backward-compatible function name; now returns only cleaned messages."""
-    return clean_messages(messages, recover=recover)
+    return clean_messages(messages)
