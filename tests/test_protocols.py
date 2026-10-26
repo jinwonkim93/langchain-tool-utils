@@ -149,7 +149,14 @@ def test_switch_api_same_checkpoint_and_actual_wire_format(tmp_path, first, seco
         assert "previous_response_id" not in payload
         history = payload.get("messages", payload.get("input"))
         encoded = json.dumps(history)
-        assert "call_fixture" in encoded
+        assert "call_fixture" not in encoded
+        assert "again" in encoded
+        assert "go" not in encoded
+        assert agent.get_state(config).values["session_api"] == second
+        assert not any(
+            isinstance(m, ToolMessage)
+            for m in agent.get_state(config).values["messages"]
+        )
         assert "fc_fixture" not in encoded
         assert "resp_fixture" not in encoded
     finally:

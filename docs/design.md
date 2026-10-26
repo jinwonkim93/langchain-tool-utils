@@ -8,7 +8,7 @@
 2. [Cline 공식 저장소의 architecture guide](https://github.com/cline/cline/blob/main/.clinerules/cline-overview.md#task-state--resumption): 재개 시 중단된 tool use에 대응하는 tool result를 보충하고 작업 상태를 다시 평가합니다. 이 프로젝트는 마지막 메시지뿐 아니라 전체 call group을 검사해 외부 Human/AI 주입으로 중간에 끊긴 그룹도 복구합니다. 참고한 자료는 저장소의 설명 문서이며 현재 버전 실행 코드를 전부 검증한 것은 아닙니다.
 3. [Claude Code session 문서](https://code.claude.com/docs/en/sessions#resume-a-session): 재개 시 중단된 도구의 결과가 기록되지 않았음을 알리고 실제 효과 확인 후 다음 작업을 정하는 동작을 설명합니다. 이 프로젝트도 결과 불명 상태에서 자동 재실행하지 않습니다. Claude Code 내부 구현은 공개 문서 이상의 추정을 하지 않았습니다.
 4. [LangChain middleware](https://docs.langchain.com/oss/python/langchain/middleware/custom), [wrap_tool_call API](https://reference.langchain.com/python/langchain/agents/middleware/types/AgentMiddleware/wrap_tool_call): before_agent/before_model에서 canonical state를 정리하고 wrap_model_call/wrap_tool_call에서 프로토콜과 실행을 분리합니다. sync/async 경로를 모두 구현했습니다.
-5. [ChatOpenAI integration](https://docs.langchain.com/oss/python/integrations/chat/openai): `use_responses_api`를 명시하고 두 모델 인스턴스를 같은 graph에서 선택합니다. 서버 continuation을 사용하지 않고 전체 portable function-call 이력을 전달합니다.
+5. [ChatOpenAI integration](https://docs.langchain.com/oss/python/integrations/chat/openai): `use_responses_api`를 명시하고 두 모델 인스턴스를 같은 graph에서 선택합니다. 서버 continuation을 사용하지 않습니다. 같은 API의 이력만 전달하고 API 전환 시 messages를 초기화합니다.
 
 ## 실행 상태 전이
 
@@ -34,7 +34,7 @@ scope는 thread ID와 상위 subgraph namespace입니다. LangGraph의 현재 mo
 
 독립 함수 `clean_messages`는 DB 없이 정리된 목록만 반환합니다. 중복 메시지/호출은 마지막 항목을 유지하고, 실제 결과는 합성 PENDING보다 우선합니다. 고아 결과는 삭제하고, 뒤늦은 결과도 전체 이력의 call ID로 연결합니다. 검사 전용 함수 `validate_messages`는 성공하면 None, 실패하면 예외를 반환합니다. 별도 repair 보고서는 없습니다.
 
-정리된 목록은 checkpoint에 저장하고, API별 변환은 요청용 복사본에서 수행합니다. Responses reasoning은 보존합니다. 같은 thread의 동시 쓰기를 직렬화하는 것은 호스트 책임입니다.
+정리된 목록은 checkpoint에 저장합니다. 세션 API가 바뀌면 입력 병합 전에 과거 messages를 초기화합니다. 같은 API에서는 reasoning을 포함한 이력을 보존합니다. 같은 thread의 동시 쓰기를 직렬화하는 것은 호스트 책임입니다.
 
 미들웨어는 마지막에 배치해 retry/승인 미들웨어에서 handler를 반복 호출할 때도 원자적 claim을 통과하게 합니다. tool 함수 자체의 내부 재시도는 통제하지 않습니다. 모델의 다음 턴이 새로운 ID로 같은 도구를 요청하는 경우에는 비즈니스 idempotency 계층이 필요합니다.
 
@@ -43,7 +43,7 @@ scope는 thread ID와 상위 subgraph namespace입니다. LangGraph의 현재 mo
 테스트는 외부 API 키 없이 실행됩니다. fake model만으로 끝내지 않고 실제 `ChatOpenAI` SDK/직렬화/파서를 HTTP MockTransport에 연결해 두 API의 요청 형식과 SSE를 검증합니다. 실제 OpenAI 서버나 모델 판단 품질을 검증하는 live 테스트는 아닙니다.
 
 - 실제 create_agent의 정상/예외/인자 검증/알 수 없는 도구/병렬 도구
-- 양방향 API 전환, 동일 체크포인트의 function call/result 보존
+- 양방향 API 전환 시 기존 function call/result 제거, 같은 API에서는 이력 유지
 - 두 API의 정상 SSE, terminal event 없는 조기 EOF, 완성 JSON의 truncated 응답
 - stalled SSE transport 종료 및 미완료 model state 미커밋
 - idle timeout, heartbeat를 포함한 total deadline, async 취소
@@ -82,3 +82,23 @@ capabilities, credentials, context limits and provider availability remain
 outside message validation. Serialize runs and checkpoint replacement per thread
 in the serving layer: the execution journal fences individual tool calls, but
 is not a lock for concurrent graph invocations or whole-history writes.
+
+
+## Session boundary and module responsibilities
+
+- `history.py`: API-neutral cleanup and structural invariants; no OpenAI import on
+  the default `clean_messages(messages)` path.
+- `protocols.py`: optional OpenAI serialization validation; explicit legacy
+  projection stays available but is not used to migrate session history.
+- `session.py`: prepares fresh graph input based on persisted `session_api`.
+  Switched input replaces messages using the reducer's remove-all sentinel.
+  Read/prepare/write requires caller-side serialization per thread.
+- `middleware.py`: persists cleaned state, validates model requests and fences
+  execution. Tool journal data survives message resets.
+
+The facade is deliberately limited to invoke/ainvoke/stream/astream. It is not a
+CompiledStateGraph or a complete Runnable substitute. Pending graph work cannot
+switch API; old checkpoint snapshots and non-message state are retained. External
+writers must not modify the managed session_api field or inject messages from a
+different API. These boundaries avoid guessing a current-turn suffix from merged
+history and avoid silently cancelling possibly running side effects.

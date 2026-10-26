@@ -5,8 +5,7 @@ LangChain agent의 메시지를 정리하는 함수입니다. **정리된 메시
 ```python
 from langchain_tool_utils import clean_messages
 
-messages = clean_messages(messages, api="responses")
-# 또는 api="chat_completions"
+messages = clean_messages(messages)  # API와 독립적인 메시지 정리
 ```
 
 ## 처리 규칙
@@ -20,7 +19,7 @@ messages = clean_messages(messages, api="responses")
 - 실제 도구 오류의 ToolMessage는 오류 상태와 내용을 유지합니다.
 - 미완성 `AIMessageChunk` 등 stream chunk는 저장할 메시지로 승격하지 않고 제거합니다.
 - 긴 ID나 허용하지 않는 문자가 들어간 call ID는 호출·결과를 함께 안정적으로 변환합니다. 기본 정책은 ASCII 영숫자·`_`·`-`, 최대 40자입니다. 이는 프로젝트의 보수적 정책이며 모든 provider의 공식 제한이 같다는 의미는 아닙니다. `max_call_id_length`로 조절할 수 있습니다.
-- 정리 후 전체 메시지 구조와 해당 API의 LangChain 직렬화 결과를 검사합니다. 호출별 결과가 정확히 하나인지 확인합니다.
+- 정리 후 전체 메시지 구조와 호출별 결과가 정확히 하나인지 검사합니다. API 직렬화 검증은 `validate_messages(messages, api=...)`로 분리했습니다. 기존 `clean_messages(..., api=...)`도 선택적 추가 검증으로 지원합니다.
 
 `clean_messages(clean_messages(messages)) == clean_messages(messages)`가 성립합니다. 잘못된 JSON 인자를 추측하거나 성공 결과를 만들어내지 않습니다. 완성된 AIMessage의 깨진 인자, 지원하지 않는 content block 등은 `UnsafeHistoryError`를 발생시켜 잘못된 요청을 차단합니다.
 
@@ -107,7 +106,13 @@ with SqliteSaver.from_conn_string("agent.sqlite") as saver:
 
 `OPENAI_API_KEY`가 필요합니다. `clean_messages` 자체는 journal이나 agent에 의존하지 않습니다. 위 factory는 실행 journal을 추가한 선택적 구성입니다. 동일 call ID의 도구 재실행을 막고, graph 저장 전 프로세스가 종료되면 저장된 결과를 재사용합니다. 종료 후 실행 결과를 모르면 PENDING, 실행 예외는 ERROR로 전달합니다. 서로 다른 call ID로 같은 작업을 요청하는 경우까지 exactly-once를 보장하지 않습니다.
 
-Responses 요청에는 reasoning 정보를 보존합니다. Chat Completions 요청용 복사본에서만 Responses 전용 항목을 제외하며, 저장한 메시지는 보존합니다. `portable_history(messages, api=...)`로 이 요청용 변환을 직접 사용할 수도 있습니다. provider 내장 tool과 legacy function_call은 지원하지 않습니다. `heal_history`는 `clean_messages`의 별칭으로 메시지 목록만 반환합니다.
+같은 `thread_id`에서 API가 바뀌면 저장된 messages를 초기화하고 **이번 호출의 새 메시지만** 남깁니다. 같은 API에서는 이력을 유지합니다. API를 다시 바꿔도 이전 이력을 복원하지 않습니다. reasoning을 포함한 이전 API 전용 데이터는 새 API에 전달하지 않습니다.
+
+factory는 graph를 감싼 `ApiSessionAgent`를 반환합니다. `invoke`, `ainvoke`, `stream`, `astream` 진입점에서 저장된 `session_api`를 확인하고, 변경 시 `REMOVE_ALL_MESSAGES`와 새 입력을 하나의 graph 입력으로 전달합니다. `get_state`/`update_state`와 비동기 대응 메서드도 지원합니다. `batch`, `astream_events`, `with_config` 등 다른 Runnable 진입점은 지원하지 않습니다. 같은 thread의 호출은 서버에서 직렬화하세요.
+
+중단된 graph 실행 중에는 API 전환을 거부합니다. 원래 API로 재개·완료한 뒤 새 요청으로 전환해야 합니다. API 정보가 없는 기존 checkpoint의 메시지는 첫 새 요청에서 초기화합니다. 메시지를 초기화해도 실행 journal과 messages 이외의 state는 유지합니다. 이전 checkpoint snapshot은 삭제하지 않으므로 데이터 삭제 기능은 아닙니다. 시스템 지침은 `create_agent`의 `system_prompt`로 설정하면 전환 후에도 적용됩니다.
+
+`portable_history`는 명시적으로 요청할 때만 쓰는 기존 호환 함수이며 자동 전환 경로에서는 사용하지 않습니다. provider 내장 tool과 legacy function_call은 지원하지 않습니다. `heal_history`는 메시지 목록만 반환합니다.
 
 ## FastAPI / SSE 중단
 

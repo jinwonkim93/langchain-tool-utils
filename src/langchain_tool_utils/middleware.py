@@ -16,10 +16,10 @@ from .history import (
     error_result,
     heal_history,
     pending_result,
-    portable_history,
     validate_calls,
 )
 from .journal import SQLiteJournal
+from .protocols import validate_messages
 
 
 def scope() -> str:
@@ -77,7 +77,21 @@ class ToolHealingMiddleware(AgentMiddleware):
 
     def _request(self, request):
         api = get_config().get("configurable", {}).get("api", self.default_api)
-        messages = portable_history(self._heal(request.messages), api=api)
+        messages = request.messages
+        if api == "chat_completions" and any(
+            isinstance(message, AIMessage)
+            and isinstance(message.content, list)
+            and any(
+                block.get("type") in {"reasoning", "function_call"}
+                for block in message.content
+                if isinstance(block, dict)
+            )
+            for message in messages
+        ):
+            raise UnsafeHistoryError(
+                "Responses content cannot be injected into a Chat Completions session"
+            )
+        validate_messages(messages, api=api)
         options = {"messages": messages}
         if self.models is not None:
             api = get_config().get("configurable", {}).get("api", self.default_api)
