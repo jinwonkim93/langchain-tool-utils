@@ -1,0 +1,84 @@
+# 설계와 참고 자료
+
+2026-10-26 확인. 아래 공개 자료의 복구 원칙을 참고해 LangChain middleware로 별도 구현했습니다. 다른 프로젝트의 기능 전체를 이식하거나 동일한 안전성을 주장하는 구현은 아닙니다.
+
+## 참고한 동작
+
+1. [OpenCode v1.2.24 processor.ts](https://github.com/anomalyco/opencode/blob/v1.2.24/packages/opencode/src/session/processor.ts): 프로세서 정리 단계에서 완료/오류 상태가 아닌 tool part를 오류 상태로 닫습니다. 이 프로젝트도 미완료를 성공 처리하지 않는 원칙을 사용합니다. 실제 실행 중 여부와 결과 저장 여부를 구분하기 위해 별도 durable journal을 추가했습니다.
+2. [Cline 공식 저장소의 architecture guide](https://github.com/cline/cline/blob/main/.clinerules/cline-overview.md#task-state--resumption): 재개 시 중단된 tool use에 대응하는 tool result를 보충하고 작업 상태를 다시 평가합니다. 이 프로젝트는 마지막 메시지뿐 아니라 전체 call group을 검사해 외부 Human/AI 주입으로 중간에 끊긴 그룹도 복구합니다. 참고한 자료는 저장소의 설명 문서이며 현재 버전 실행 코드를 전부 검증한 것은 아닙니다.
+3. [Claude Code session 문서](https://code.claude.com/docs/en/sessions#resume-a-session): 재개 시 중단된 도구의 결과가 기록되지 않았음을 알리고 실제 효과 확인 후 다음 작업을 정하는 동작을 설명합니다. 이 프로젝트도 결과 불명 상태에서 자동 재실행하지 않습니다. Claude Code 내부 구현은 공개 문서 이상의 추정을 하지 않았습니다.
+4. [LangChain middleware](https://docs.langchain.com/oss/python/langchain/middleware/custom), [wrap_tool_call API](https://reference.langchain.com/python/langchain/agents/middleware/types/AgentMiddleware/wrap_tool_call): before_agent/before_model에서 canonical state를 정리하고 wrap_model_call/wrap_tool_call에서 프로토콜과 실행을 분리합니다. sync/async 경로를 모두 구현했습니다.
+5. [ChatOpenAI integration](https://docs.langchain.com/oss/python/integrations/chat/openai): `use_responses_api`를 명시하고 두 모델 인스턴스를 같은 graph에서 선택합니다. 서버 continuation을 사용하지 않고 전체 portable function-call 이력을 전달합니다.
+
+## 실행 상태 전이
+
+```text
+정상 종료가 검증된 모델 응답
+   -> ready (scope + call ID + owner/name/args fingerprint)
+   -> 원자적 claim
+   -> running [도구 실행 전에 커밋]
+   -> 도구 handler 한 번 진입
+   -> done + 결과 [graph 반환 전에 커밋]
+
+재개:
+  ready        -> pending tools 노드에서 한 번 실행 가능
+  done         -> 저장된 ToolMessage/Command 재사용
+  running      -> PENDING, 같은 call ID의 자동 재실행 차단
+  기록 없음    -> 외부 호출은 PENDING, 같은 call ID의 실행 차단
+  fingerprint 충돌 -> 명시적 오류
+```
+
+scope는 thread ID와 상위 subgraph namespace입니다. LangGraph의 현재 model/tools 노드 task suffix는 scope에서 제외합니다. 그래야 같은 호출이 model 생성, tool 실행, 재개에서 동일한 키를 사용합니다.
+
+모델 응답은 모든 chunk 수신 후에만 실행 근거로 등록합니다. Chat Completions는 tool 호출의 `finish_reason=tool_calls` 또는 최종 텍스트의 `stop`, Responses는 `status=completed`를 확인합니다. 인자가 JSON으로 파싱되더라도 조기 EOF, `length`, `incomplete`, 미완료 chunk는 실행하지 않습니다. SSE timeout 시 부분 출력을 완성된 AIMessage로 승격하지 않습니다.
+
+독립 함수 `clean_messages`는 DB 없이 정리된 목록만 반환합니다. 중복 메시지/호출은 마지막 항목을 유지하고, 실제 결과는 합성 PENDING보다 우선합니다. 고아 결과는 삭제하고, 뒤늦은 결과도 전체 이력의 call ID로 연결합니다. 검사 전용 함수 `validate_messages`는 성공하면 None, 실패하면 예외를 반환합니다. 별도 repair 보고서는 없습니다.
+
+정리된 목록은 checkpoint에 저장하고, API별 변환은 요청용 복사본에서 수행합니다. Responses reasoning은 보존합니다. 같은 thread의 동시 쓰기를 직렬화하는 것은 호스트 책임입니다.
+
+미들웨어는 마지막에 배치해 retry/승인 미들웨어에서 handler를 반복 호출할 때도 원자적 claim을 통과하게 합니다. tool 함수 자체의 내부 재시도는 통제하지 않습니다. 모델의 다음 턴이 새로운 ID로 같은 도구를 요청하는 경우에는 비즈니스 idempotency 계층이 필요합니다.
+
+## 테스트
+
+테스트는 외부 API 키 없이 실행됩니다. fake model만으로 끝내지 않고 실제 `ChatOpenAI` SDK/직렬화/파서를 HTTP MockTransport에 연결해 두 API의 요청 형식과 SSE를 검증합니다. 실제 OpenAI 서버나 모델 판단 품질을 검증하는 live 테스트는 아닙니다.
+
+- 실제 create_agent의 정상/예외/인자 검증/알 수 없는 도구/병렬 도구
+- 양방향 API 전환, 동일 체크포인트의 function call/result 보존
+- 두 API의 정상 SSE, terminal event 없는 조기 EOF, 완성 JSON의 truncated 응답
+- stalled SSE transport 종료 및 미완료 model state 미커밋
+- idle timeout, heartbeat를 포함한 total deadline, async 취소
+- 누락/중복/충돌/고아 tool result, 외부 Human/AI 주입, model 노드로 state 직접 주입
+- tools 이전 checkpoint interrupt와 재개, 도구 본문 interrupt의 보수적 차단
+- SQLite 원자적 동시 claim, thread 격리와 fingerprint 충돌
+- ToolMessage와 Command 결과 저장·재생
+- **실제 하위 프로세스 `os._exit`**로 실행 중 및 journal commit 직후 종료 후, 디스크 checkpointer/journal을 다시 열어 복구. 부수 효과 파일에 한 번만 기록되는지 검증
+
+검증 환경: Python 3.14.2, LangChain 1.4.7, langchain-openai 1.7.2, LangGraph 1.2.17. 선언된 최소 Python 3.11에서의 별도 실행 검증은 하지 않았습니다. 정확한 테스트 의존성은 requirements-test.lock을 사용합니다.
+
+## Adversarial review and regression coverage
+
+The review found and fixed three gaps before the initial release:
+
+- Calls injected by mutating `AIMessage.tool_calls` could omit `type`. A JSON
+  checkpoint round trip added it, breaking structural idempotence. Cleanup now
+  canonicalizes retained calls to `type="tool_call"`.
+- Validation compared serialized call IDs but did not compare native content
+  block names/arguments with canonical calls. Conflicting representations now
+  fail validation; cleanup synchronizes them using the canonical call.
+- Direct validation could accept legacy `additional_kwargs.function_call` even
+  though cleanup rejected it. Both paths now reject this unsupported protocol.
+
+`test_history_adversarial.py` uses an independent scan-based oracle for retained
+call owners, arguments and result precedence. It checks 4,681 short histories,
+5,040 permutations of seven events, 100 reproducible longer random histories,
+90 ID-budget/late-result scenarios, every cut in a stream-event sequence, and
+changing ID budgets across checkpoints. Each accepted history is checked for
+input immutability, contiguous matching results, both API serializers, repeated
+cleanup and JSON checkpoint round-trip idempotence. These are bounded exhaustive
+and seeded tests, not a claim that every possible input was enumerated.
+
+Tests use mock HTTP/SSE rather than the live OpenAI service. Model-specific
+capabilities, credentials, context limits and provider availability remain
+outside message validation. Serialize runs and checkpoint replacement per thread
+in the serving layer: the execution journal fences individual tool calls, but
+is not a lock for concurrent graph invocations or whole-history writes.

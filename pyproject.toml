@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "langchain-tool-utils"
+version = "0.1.0"
+description = "Conservative tool history healing for LangChain create_agent"
+requires-python = ">=3.11"
+dependencies = ["langchain>=1.4.7,<1.5", "langchain-openai>=1.7.2,<1.8", "langgraph>=1.2.17,<1.3", "httpx>=0.28,<1"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=0.24", "langgraph-checkpoint-sqlite>=3.1.2,<4", "ruff>=0.17,<0.18"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+testpaths = ["tests"]
